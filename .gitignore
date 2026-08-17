@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 venv/
 data/*.db
+data/chat_history.json
 charts/*.png
 charts/*.html
 .streamlit/secrets.toml

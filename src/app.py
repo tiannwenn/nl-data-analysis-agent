@@ -14,6 +14,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.agent import DataAnalysisAgent
+from src.chat_store import (
+    delete_conversation,
+    deserialize_messages,
+    get_conversation,
+    group_conversations,
+    load_store,
+    rename_conversation,
+    start_new_conversation,
+    switch_conversation,
+    sync_current_messages,
+)
 from src.config import DB_PATH, load_env
 from src.db import ensure_db
 
@@ -179,18 +190,26 @@ def _scroll_to_latest(anchor_id: str | None = None, *, mode: str = "once") -> No
             if (window.__userPausedAutoScroll) return;
             try {{
               const msgs = document.querySelectorAll('[data-testid="stChatMessage"]');
-              if (msgs.length) {{
-                msgs[msgs.length - 1].scrollIntoView({{
-                  behavior: "smooth",
-                  block: "nearest",
-                  inline: "nearest"
-                }});
+              if (!msgs.length) return;
+              // On a new turn, keep the user bubble fully visible under the toolbar.
+              // Do NOT force scrollTop=scrollHeight (that hides the first line).
+              let target = msgs[msgs.length - 1];
+              if (mode === "start" && msgs.length >= 2) {{
+                target = msgs[msgs.length - 2];
               }}
-              pickScrollables().forEach(function(el) {{
-                try {{
-                  el.scrollTop = el.scrollHeight;
-                }} catch (e) {{}}
+              target.scrollIntoView({{
+                behavior: mode === "once" ? "auto" : "smooth",
+                block: mode === "start" ? "start" : "nearest",
+                inline: "nearest"
               }});
+              if (mode === "start") {{
+                // Extra offset beyond scroll-margin-top (sticky header + brand bar).
+                const offset = 96;
+                pickScrollables().forEach(function(el) {{
+                  try {{ el.scrollTop = Math.max(0, el.scrollTop - offset); }} catch (e) {{}}
+                }});
+                try {{ window.scrollBy(0, -offset); }} catch (e) {{}}
+              }}
             }} catch (e) {{}}
           }}
 
@@ -204,6 +223,342 @@ def _scroll_to_latest(anchor_id: str | None = None, *, mode: str = "once") -> No
         unsafe_allow_javascript=True,
         width="content",
     )
+
+
+_STOP_REPLY = "分析已停止。可修改问题后重新提问。"
+
+# IMPORTANT: While ScriptRequestType.STOP is pending, ANY st.session_state
+# get/set calls SafeSessionState yield_callback → raises StopException.
+# Cancel intent must live outside session_state until STOP is cleared.
+_cancel_by_session: dict[str, bool] = {}
+
+
+def _script_session_id() -> str:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        ctx = get_script_run_ctx()
+        return str(getattr(ctx, "session_id", None) or "default")
+    except Exception:  # noqa: BLE001
+        return "default"
+
+
+def _latch_cancel() -> None:
+    _cancel_by_session[_script_session_id()] = True
+
+
+def _clear_cancel_latch() -> None:
+    _cancel_by_session.pop(_script_session_id(), None)
+
+
+def _cancel_latched() -> bool:
+    return bool(_cancel_by_session.get(_script_session_id()))
+
+
+def _native_stop_pending() -> bool:
+    """True when Streamlit script_requests is in terminal STOP state.
+
+    Reads only script_requests — never touches st.session_state (would yield).
+    """
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        from streamlit.runtime.scriptrunner_utils.script_requests import ScriptRequestType
+
+        ctx = get_script_run_ctx()
+        if ctx is None:
+            return False
+        requests = getattr(ctx, "script_requests", None)
+        if requests is None:
+            return False
+        with requests._lock:  # noqa: SLF001 — cooperative cancel with Streamlit Stop
+            return requests._state == ScriptRequestType.STOP  # noqa: SLF001
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _streamlit_stop_requested() -> bool:
+    """True when user clicked chat_input stop / toolbar Stop / cancel latch.
+
+    Must not touch st.session_state while native STOP may be pending.
+    """
+    if _cancel_latched():
+        return True
+    if _native_stop_pending():
+        _latch_cancel()
+        return True
+    return False
+
+
+def _is_streamlit_stop_exc(exc: BaseException) -> bool:
+    """StopException inherits BaseException (not Exception) — must detect by name/type."""
+    name = type(exc).__name__
+    if name in {"StopException", "ScriptControlException"}:
+        return True
+    try:
+        from streamlit.runtime.scriptrunner_utils.exceptions import StopException
+
+        return isinstance(exc, StopException)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_streamlit_rerun_exc(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    if name == "RerunException":
+        return True
+    try:
+        from streamlit.runtime.scriptrunner_utils.exceptions import RerunException
+
+        return isinstance(exc, RerunException)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _clear_native_stop_for_rerun() -> bool:
+    """STOP is terminal for request_rerun() and blocks session_state access.
+
+    Clear it before any st.session_state / widget / st.rerun() calls.
+    Cancel intent must already be latched via ``_latch_cancel()``.
+    """
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        from streamlit.runtime.scriptrunner_utils.script_requests import ScriptRequestType
+
+        ctx = get_script_run_ctx()
+        requests = getattr(ctx, "script_requests", None) if ctx else None
+        if requests is None:
+            return False
+        with requests._lock:  # noqa: SLF001
+            if requests._state == ScriptRequestType.STOP:  # noqa: SLF001
+                requests._state = ScriptRequestType.CONTINUE  # noqa: SLF001
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _append_stopped_assistant(*, steps: list | None = None) -> bool:
+    """Persist stop reply to messages + disk.
+
+    Caller must clear native STOP first (session_state yields otherwise).
+    ``steps=None`` means do not overwrite an existing stop message's steps.
+    """
+    msgs = list(st.session_state.get("messages") or [])
+    clean_steps = (
+        [{k: v for k, v in ev.items() if k != "figure"} for ev in steps]
+        if steps is not None
+        else None
+    )
+    if msgs and msgs[-1].get("role") == "assistant" and msgs[-1].get("content") == _STOP_REPLY:
+        if clean_steps is not None:
+            msgs[-1] = {
+                **msgs[-1],
+                "process_steps": clean_steps,
+            }
+            st.session_state.messages = msgs
+            _persist_current_conversation()
+        return False
+    if not msgs or msgs[-1].get("role") != "user":
+        return False
+    msgs.append(
+        {
+            "role": "assistant",
+            "content": _STOP_REPLY,
+            "figures": [],
+            "tables": [],
+            "process_steps": clean_steps or [],
+        }
+    )
+    st.session_state.messages = msgs
+    _persist_current_conversation()
+    return True
+
+
+def _commit_stop_and_rerun(*, steps: list | None = None) -> None:
+    """Safe stop teardown: latch → clear STOP → persist → full-page rerun."""
+    _latch_cancel()
+    _clear_native_stop_for_rerun()
+    try:
+        _append_stopped_assistant(steps=steps)
+    finally:
+        _clear_cancel_latch()
+        st.session_state.pop("_agent_cancel", None)
+    try:
+        st.rerun()
+    except BaseException as exc:  # noqa: BLE001
+        if _is_streamlit_rerun_exc(exc):
+            raise
+        if _is_streamlit_stop_exc(exc):
+            return
+        raise
+
+
+def _repair_incomplete_turn() -> bool:
+    """If a previous run was killed mid-flight, close the orphan user turn."""
+    return _append_stopped_assistant()
+
+def _init_chat_state() -> None:
+    """Load multi-conversation store once per browser session."""
+    if "chat_store" not in st.session_state:
+        st.session_state.chat_store = load_store()
+    store = st.session_state.chat_store
+    if "current_conv_id" not in st.session_state:
+        st.session_state.current_conv_id = store.get("current_id")
+    if "messages" not in st.session_state:
+        conv = get_conversation(store, st.session_state.current_conv_id)
+        st.session_state.messages = deserialize_messages((conv or {}).get("messages"))
+
+
+def _persist_current_conversation() -> None:
+    store = st.session_state.chat_store
+    conv_id = st.session_state.current_conv_id
+    sync_current_messages(store, conv_id=conv_id, messages=st.session_state.messages)
+    st.session_state.chat_store = store
+
+
+def _activate_conversation(conv_id: str) -> None:
+    store = st.session_state.chat_store
+    conv = switch_conversation(store, conv_id)
+    if not conv:
+        return
+    st.session_state.chat_store = store
+    st.session_state.current_conv_id = conv_id
+    st.session_state.messages = deserialize_messages(conv.get("messages"))
+    st.session_state.pop("_scroll_to_bottom", None)
+    st.session_state.pop("_agent_cancel", None)
+
+
+def _render_sidebar() -> None:
+    store = st.session_state.chat_store
+    current_id = st.session_state.current_conv_id
+    current_msgs = st.session_state.get("messages") or []
+
+    if st.button("新建对话", width="stretch", type="primary"):
+        if not current_msgs:
+            st.toast("当前对话为空，无需新建")
+        else:
+            _persist_current_conversation()
+            conv = start_new_conversation(st.session_state.chat_store)
+            st.session_state.current_conv_id = conv["id"]
+            st.session_state.messages = []
+            st.session_state.pop("_scroll_to_bottom", None)
+            st.session_state.pop("_agent_cancel", None)
+            st.rerun()
+
+    st.header("示例问题")
+    for i, q in enumerate(EXAMPLE_QUERIES, 1):
+        if st.button(f"示例 {i}", key=f"ex_{i}", width="stretch"):
+            st.session_state["prefill"] = q
+            _request_scroll_to_bottom()
+
+    st.divider()
+    st.caption("历史对话")
+    convs = list(store.get("conversations") or [])
+    convs = sorted(
+        convs,
+        key=lambda c: c.get("updated_at") or c.get("created_at") or "",
+        reverse=True,
+    )
+    visible = []
+    for conv in convs:
+        cid = conv.get("id")
+        msgs = conv.get("messages") or []
+        # Show current even if empty (DeepSeek-style live slot); hide other blanks.
+        if not msgs and cid != current_id:
+            continue
+        visible.append(conv)
+
+    if not visible:
+        st.caption("暂无记录，提问后会出现在这里")
+    else:
+        for label, group in group_conversations(visible):
+            st.markdown(
+                f"<div style='font-size:0.75rem;opacity:0.65;margin:0.55rem 0 0.2rem;'>{label}</div>",
+                unsafe_allow_html=True,
+            )
+            for conv in group:
+                cid = conv.get("id") or ""
+                title = (conv.get("title") or "新对话").strip() or "新对话"
+                is_current = cid == current_id
+                # Current session stays in the list (highlighted). Still clickable so it
+                # doesn't look "broken"; click is a no-op when already active.
+                open_col, menu_col = st.columns([5, 1], gap="small")
+                with open_col:
+                    label_txt = f"{'● ' if is_current else ''}{title}"
+                    if st.button(
+                        label_txt,
+                        key=f"conv_{cid}",
+                        width="stretch",
+                        type="primary" if is_current else "secondary",
+                    ):
+                        if not is_current:
+                            _activate_conversation(cid)
+                            st.rerun()
+                with menu_col:
+                    with st.popover("⋯"):
+                        if st.button(
+                            "重命名",
+                            key=f"rename_open_{cid}",
+                            width="stretch",
+                            type="secondary",
+                        ):
+                            st.session_state["rename_cid"] = cid
+                            st.session_state["rename_draft"] = title
+                            st.rerun()
+                        if st.button(
+                            "删除",
+                            key=f"del_{cid}",
+                            width="stretch",
+                            type="secondary",
+                        ):
+                            if cid != current_id:
+                                _persist_current_conversation()
+                            nxt = delete_conversation(st.session_state.chat_store, cid)
+                            st.session_state.chat_store = load_store()
+                            st.session_state.current_conv_id = st.session_state.chat_store.get(
+                                "current_id"
+                            )
+                            cur = get_conversation(
+                                st.session_state.chat_store,
+                                st.session_state.current_conv_id,
+                            )
+                            st.session_state.messages = deserialize_messages(
+                                (cur or nxt or {}).get("messages")
+                            )
+                            st.session_state.pop("_agent_cancel", None)
+                            st.session_state.pop("rename_cid", None)
+                            st.toast(f"已删除：{title}")
+                            st.rerun()
+
+                if st.session_state.get("rename_cid") == cid:
+                    draft = st.text_input(
+                        "新标题",
+                        value=st.session_state.get("rename_draft", title),
+                        key=f"rename_input_{cid}",
+                        label_visibility="collapsed",
+                        placeholder="输入新标题（不能为空）",
+                    )
+                    ok_col, cancel_col = st.columns(2)
+                    with ok_col:
+                        if st.button("确定", key=f"rename_ok_{cid}", width="stretch"):
+                            new_title = (draft or "").strip()
+                            if not new_title:
+                                st.toast("标题不能为空，仍保持原名")
+                            elif rename_conversation(
+                                st.session_state.chat_store, cid, new_title
+                            ):
+                                st.session_state.chat_store = load_store()
+                                st.session_state.pop("rename_cid", None)
+                                st.session_state.pop("rename_draft", None)
+                                st.toast(f"已重命名为：{new_title}")
+                                st.rerun()
+                            else:
+                                st.toast("重命名失败，仍保持原名")
+                    with cancel_col:
+                        if st.button("取消", key=f"rename_cancel_{cid}", width="stretch"):
+                            st.session_state.pop("rename_cid", None)
+                            st.session_state.pop("rename_draft", None)
+                            st.rerun()
 
 
 def _request_scroll_to_bottom() -> None:
@@ -328,8 +683,153 @@ def _render_message(msg: dict[str, Any], *, key_prefix: str) -> None:
 def main() -> None:
     st.set_page_config(page_title="自然语言数据分析 Agent", layout="wide")
     load_env()
-
-    st.title("自然语言数据分析 Agent")
+    st.markdown(
+        """
+        <style>
+        /* Brand on Streamlit top bar — always dark bar + light text (light theme
+           inherits dark text, which made the title / Deploy / ⋮ invisible) */
+        header[data-testid="stHeader"] {
+            background-color: #0e1117 !important;
+        }
+        header[data-testid="stHeader"]::before {
+            content: "自然语言数据分析 Agent";
+            position: absolute;
+            left: 3.75rem; /* clear sidebar toggle */
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 1.05rem;
+            font-weight: 600;
+            letter-spacing: 0.01em;
+            white-space: nowrap;
+            pointer-events: none;
+            z-index: 1;
+            color: #fafafa !important;
+            opacity: 0.95;
+        }
+        /* Force light chrome on dark header (Deploy + ⋮ stay readable in Light theme) */
+        header[data-testid="stHeader"] button,
+        header[data-testid="stHeader"] a,
+        header[data-testid="stHeader"] [kind],
+        header[data-testid="stHeader"] [data-testid="stToolbarActions"],
+        header[data-testid="stHeader"] [data-testid="stMainMenu"] {
+            color: #fafafa !important;
+        }
+        header[data-testid="stHeader"] button:hover,
+        header[data-testid="stHeader"] a:hover {
+            color: #ffffff !important;
+            background-color: rgba(250, 250, 250, 0.12) !important;
+        }
+        header[data-testid="stHeader"] svg {
+            fill: #fafafa !important;
+            stroke: #fafafa !important;
+            color: #fafafa !important;
+        }
+        header[data-testid="stHeader"] span,
+        header[data-testid="stHeader"] p,
+        header[data-testid="stHeader"] label {
+            color: #fafafa !important;
+        }
+        /* Keep content below sticky header (1rem was too small → first line clipped) */
+        div.block-container {
+            padding-top: 4.5rem !important;
+            padding-bottom: 1rem !important;
+            max-width: 1100px;
+        }
+        div[data-testid="stMainBlockContainer"] div[data-testid="stVerticalBlock"] {
+            gap: 0.35rem !important;
+        }
+        div[data-testid="stChatMessage"] {
+            padding-top: 0.25rem !important;
+            padding-bottom: 0.25rem !important;
+            gap: 0.3rem !important;
+            margin: 0 !important;
+            overflow: visible !important;
+            /* scrollIntoView(block=start) must clear sticky header */
+            scroll-margin-top: 4.75rem !important;
+        }
+        div[data-testid="stChatMessage"] [data-testid="stChatMessageContent"] {
+            padding-top: 0.35rem !important;
+            padding-bottom: 0.35rem !important;
+            overflow: visible !important;
+        }
+        div[data-testid="stStatus"] {
+            margin: 0 !important;
+        }
+        .stMarkdown h3 {
+            margin-top: 0.2rem !important;
+            margin-bottom: 0.3rem !important;
+            font-size: 1.15rem !important;
+        }
+        div[data-testid="stExpander"] {
+            margin: 0.1rem 0 !important;
+        }
+        /* Hide Streamlit toolbar Stop / running widget — chat_input stop is enough */
+        [data-testid="stStatusWidget"],
+        [data-testid="stStatusWidget"] button {
+            display: none !important;
+        }
+        /* History ⋯ popover: keep default chevron; shrink menu chrome */
+        section[data-testid="stSidebar"] [data-testid="stPopover"] > div > button {
+            min-height: 2rem !important;
+            height: 2rem !important;
+            padding-left: 0.4rem !important;
+            padding-right: 0.4rem !important;
+        }
+        div[data-testid="stPopoverBody"],
+        div[data-baseweb="popover"] > div {
+            min-width: 7.5rem !important;
+            padding: 0.35rem !important;
+        }
+        /* Two independent compact buttons with clear separation */
+        div[data-testid="stPopoverBody"] button,
+        div[data-baseweb="popover"] button {
+            min-height: 1.85rem !important;
+            height: 1.85rem !important;
+            padding: 0.2rem 0.55rem !important;
+            font-size: 0.84rem !important;
+            line-height: 1.2 !important;
+            margin: 0 !important;
+        }
+        div[data-testid="stPopoverBody"] [data-testid="stVerticalBlock"],
+        div[data-baseweb="popover"] [data-testid="stVerticalBlock"] {
+            gap: 0.35rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    # Fallback: newer Streamlit host chrome labels the control as plain "Stop".
+    # Never hide the chat_input stop button (stChatInputStopButton).
+    st.html(
+        """
+        <script>
+        (function() {
+          function hideToolbarStop() {
+            document.querySelectorAll("button, [role='button']").forEach(function(el) {
+              if (el.closest('[data-testid="stChatInput"]') ||
+                  el.getAttribute("data-testid") === "stChatInputStopButton") {
+                return;
+              }
+              const t = (el.textContent || "").replace(/\\s+/g, " ").trim();
+              if (t === "Stop") {
+                el.style.setProperty("display", "none", "important");
+              }
+            });
+          }
+          hideToolbarStop();
+          if (!window.__hideStopObserver) {
+            window.__hideStopObserver = new MutationObserver(hideToolbarStop);
+            window.__hideStopObserver.observe(document.documentElement, {
+              childList: true,
+              subtree: true
+            });
+          }
+        })();
+        </script>
+        """,
+        unsafe_allow_javascript=True,
+        width="content",
+    )
 
     try:
         _ensure_database()
@@ -338,55 +838,38 @@ def main() -> None:
         st.error(f"数据库不可用：{exc}")
         st.stop()
 
+    _init_chat_state()
+
     with st.sidebar:
-        st.header("调用节奏")
-        pace_label = st.radio(
-            "LLM 限速模式",
-            options=["自动(推荐)", "快速(单次问答)", "稳定(批量验收)"],
-            index=0,
-            help=(
-                "快速：间隔 0s，响应更快；稳定：间隔 6s，不易 429；"
-                "自动：默认快速，触发限速后本会话自动切到稳定。"
-            ),
-        )
-        pace_mode = {
-            "自动(推荐)": "auto",
-            "快速(单次问答)": "fast",
-            "稳定(批量验收)": "stable",
-        }[pace_label]
+        _render_sidebar()
 
-        st.header("示例问题")
-        for i, q in enumerate(EXAMPLE_QUERIES, 1):
-            if st.button(f"示例 {i}", key=f"ex_{i}", width="stretch"):
-                st.session_state["prefill"] = q
-                _request_scroll_to_bottom()
-        st.divider()
-        if st.button("清空对话", width="stretch"):
-            st.session_state.messages = []
-            st.session_state.pop("_scroll_to_bottom", None)
-            st.rerun()
+    _repair_incomplete_turn()
 
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    # Fixed-height chat pane; autoscroll=False so Streamlit won't keep pinning
-    # to bottom after the user starts reading earlier messages.
-    chat_box = st.container(height=720, autoscroll=False, border=False)
+    # No fixed height — avoids a large empty black band under short replies.
+    chat_box = st.container(border=False)
+    conv_key = st.session_state.current_conv_id or "main"
     with chat_box:
         for idx, msg in enumerate(st.session_state.messages):
-            _render_message(msg, key_prefix=f"hist_{idx}")
+            _render_message(msg, key_prefix=f"hist_{conv_key}_{idx}")
 
     # After replaying history, also jump via main-document JS when requested.
     _maybe_scroll_to_bottom()
 
     prefill = st.session_state.pop("prefill", None)
-    user_input = st.chat_input("用自然语言描述你的查询或分析需求…")
+    # DeepSeek-style: send button becomes stop (circle+square) while the script runs.
+    user_input = st.chat_input(
+        "用自然语言描述你的查询或分析需求…",
+        submit_mode="stop",
+    )
     query = prefill or user_input
     if not query:
         return
 
     _request_scroll_to_bottom()
+    _clear_cancel_latch()
+    st.session_state.pop("_agent_cancel", None)
     st.session_state.messages.append({"role": "user", "content": query})
+    _persist_current_conversation()
     with chat_box:
         with st.chat_message("user"):
             st.markdown(query)
@@ -395,49 +878,128 @@ def main() -> None:
             anchor = f"latest_{len(st.session_state.messages)}"
             _scroll_to_latest(anchor, mode="start")
 
-            status = st.status("Agent 分析中…", expanded=True)
+            progress_slot = st.empty()
+            with progress_slot.container():
+                status = st.status("Agent 分析中…", expanded=True)
             live_steps: list[dict[str, Any]] = []
             event_count = 0
+            stop_ui_done = False
+
+            def _mark_stopping() -> None:
+                """Latch cancel; clear STOP before any session_state / widget I/O."""
+                nonlocal stop_ui_done
+                if stop_ui_done:
+                    return
+                stop_ui_done = True
+                _latch_cancel()
+                # Critical: clear STOP before touching session_state or status.
+                _clear_native_stop_for_rerun()
+                _append_stopped_assistant(steps=live_steps)
+                try:
+                    status.update(label="正在停止…", state="error", expanded=True)
+                    status.write("已收到停止请求，正在结束当前步骤…")
+                except BaseException:  # noqa: BLE001
+                    try:
+                        progress_slot.empty()
+                        st.caption("✗ 正在停止…")
+                    except BaseException:  # noqa: BLE001
+                        pass
 
             def on_event(event: dict[str, Any]) -> None:
                 nonlocal event_count
+                if _streamlit_stop_requested():
+                    _mark_stopping()
+                    return
                 live_steps.append(event)
                 event_count += 1
                 text = event.get("text") or ""
                 tool = event.get("tool")
-                if tool:
-                    status.write(f"`{tool}` — {text}")
-                elif text:
-                    status.write(text)
-                # Follow only while generating; stops immediately if user scrolls up.
-                if event_count in {1, 3, 6} or (event_count > 6 and event_count % 4 == 0):
-                    _scroll_to_latest(f"{anchor}_step{event_count}", mode="follow")
+                try:
+                    if tool:
+                        status.write(f"`{tool}` — {text}")
+                    elif text:
+                        status.write(text)
+                    if event_count in {1, 3, 6} or (
+                        event_count > 6 and event_count % 4 == 0
+                    ):
+                        _scroll_to_latest(f"{anchor}_step{event_count}", mode="follow")
+                except BaseException as exc:  # noqa: BLE001 — Stop mid-write / scroll
+                    if _is_streamlit_rerun_exc(exc):
+                        raise
+                    _mark_stopping()
+                    return
 
-            try:
-                agent = DataAnalysisAgent(max_steps=10, pace_mode=pace_mode)
-                result = agent.run(query, on_event=on_event)
-                status.update(
-                    label=f"完成（{result.steps} 步 · {pace_label}）",
-                    state="complete",
-                )
-            except Exception as exc:  # noqa: BLE001
-                status.update(label="失败", state="error")
-                st.error(str(exc))
+            def _persist_assistant(
+                content: str,
+                *,
+                figures: list | None = None,
+                tables: list | None = None,
+                steps: list | None = None,
+            ) -> None:
                 st.session_state.messages.append(
                     {
                         "role": "assistant",
-                        "content": f"执行失败：{exc}",
-                        "figures": [],
-                        "tables": [],
-                        "process_steps": live_steps,
+                        "content": content,
+                        "figures": _dedupe_figures(figures or []),
+                        "tables": (tables or [])[-3:],
+                        "process_steps": [
+                            {k: v for k, v in ev.items() if k != "figure"}
+                            for ev in (steps or live_steps)
+                        ],
                     }
                 )
-                _scroll_to_latest(f"{anchor}_end", mode="once")
+                _persist_current_conversation()
+
+            def _finish_progress(label: str, *, ok: bool) -> None:
+                """Collapse live status (keep steps inside) instead of wiping it."""
+                try:
+                    status.update(
+                        label=f"✓ {label}" if ok else f"✗ {label}",
+                        state="complete" if ok else "error",
+                        expanded=False,
+                    )
+                except BaseException:  # noqa: BLE001
+                    try:
+                        progress_slot.empty()
+                        st.caption(f"{'✓' if ok else '✗'} {label}")
+                        _render_process_steps(live_steps, expanded=False)
+                    except BaseException:  # noqa: BLE001
+                        pass
+
+            def _finalize_stopped() -> None:
+                _commit_stop_and_rerun(steps=live_steps)
+
+            try:
+                agent = DataAnalysisAgent(max_steps=10, pace_mode="auto")
+                result = agent.run(
+                    query,
+                    on_event=on_event,
+                    should_cancel=_streamlit_stop_requested,
+                )
+            except BaseException as exc:  # noqa: BLE001 — StopException is BaseException
+                if _is_streamlit_rerun_exc(exc):
+                    raise
+                if _is_streamlit_stop_exc(exc) or _streamlit_stop_requested():
+                    _finalize_stopped()
+                    return
+                if isinstance(exc, Exception):
+                    if _streamlit_stop_requested() or "Stop" in type(exc).__name__:
+                        _finalize_stopped()
+                        return
+                    _finish_progress("失败", ok=False)
+                    st.error(str(exc))
+                    _persist_assistant(f"执行失败：{exc}", steps=live_steps)
+                    st.rerun()
+                    return
+                raise
+
+            if result.error == "cancelled" or _cancel_latched():
+                _finalize_stopped()
                 return
 
-            st.markdown("---")
+            _finish_progress(f"完成（{result.steps} 步）", ok=True)
+
             answer_text = _clean_answer(result.answer)
-            # Avoid duplicate「分析结论」heading when model already wrote it.
             if not re.match(r"^#{1,3}\s*分析结论", answer_text):
                 st.markdown("### 分析结论")
             _render_answer_with_figures(
@@ -452,20 +1014,13 @@ def main() -> None:
                 with st.expander(f"数据表：{name}", expanded=False):
                     st.dataframe(df, width="stretch")
 
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": _clean_answer(result.answer),
-                    "figures": _dedupe_figures(result.figures),
-                    "tables": result.tables[-3:],
-                    "process_steps": [
-                        {k: v for k, v in ev.items() if k != "figure"}
-                        for ev in (result.process_steps or live_steps)
-                    ],
-                }
+            _persist_assistant(
+                _clean_answer(result.answer),
+                figures=result.figures,
+                tables=result.tables,
+                steps=result.process_steps or live_steps,
             )
-            _scroll_to_latest(f"{anchor}_end", mode="once")
-
+            st.rerun()
 
 if __name__ == "__main__":
     main()

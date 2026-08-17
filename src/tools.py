@@ -245,6 +245,48 @@ def _recover_finish_from_raw(raw_args: str) -> str:
     return raw.strip().strip('"')
 
 
+def _recover_sql_from_args(args: dict[str, Any], raw_args: str = "") -> str:
+    """Pull a non-empty SQL string from common keys or broken tool JSON."""
+    if isinstance(args, dict):
+        for key in ("sql", "query", "SQL", "statement"):
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    raw = (raw_args or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return _recover_sql_from_args(parsed, "")
+        if isinstance(parsed, str) and re.match(r"(?is)^\s*(WITH|SELECT)\b", parsed):
+            return parsed.strip()
+    except json.JSONDecodeError:
+        pass
+    m = re.search(
+        r'"(?:sql|query|SQL|statement)"\s*:\s*"(.*?)"\s*(?:,|\})',
+        raw,
+        flags=re.DOTALL,
+    )
+    if m:
+        frag = m.group(1)
+        try:
+            return json.loads(f'"{frag}"').strip()
+        except json.JSONDecodeError:
+            return (
+                frag.replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace('\\"', '"')
+                .strip()
+            )
+    m = re.search(r"(?is)\b((?:WITH|SELECT)\b[\s\S]+)$", raw)
+    if m:
+        sql = m.group(1).strip().rstrip('"').rstrip("'").rstrip("}")
+        if len(sql) > 20:
+            return sql
+    return ""
+
+
 def _should_stack_bars(df: pd.DataFrame, x: str, color: str | None, title: str) -> bool:
     """Stack only for composition charts (e.g. SKU share within a store).
 
@@ -610,7 +652,7 @@ class ToolRuntime:
         return json.dumps({"ok": True, "schema": text}, ensure_ascii=False)
 
     def _run_sql(self, args: dict[str, Any]) -> str:
-        sql = (args.get("sql") or "").strip()
+        sql = _recover_sql_from_args(args if isinstance(args, dict) else {}, "")
         name = (args.get("result_name") or "").strip() or f"result_{len(self.artifacts.dataframes) + 1}"
         if not sql:
             return json.dumps(
@@ -618,9 +660,10 @@ class ToolRuntime:
                     "ok": False,
                     "error": "SQL is empty",
                     "hint": (
-                        "禁止提交空 sql。请直接写出完整 WITH/SELECT："
-                        "先按 store_name+product_name GROUP BY 算出 q1/q2 销额与毛利率，"
-                        "再在外层 WHERE 过滤低毛利（不要把 SUM() 写进 WHERE）。"
+                        "禁止提交空 sql。请直接写出完整 WITH/SELECT（含筛选与聚合），"
+                        "例如退款原因下钻："
+                        "SELECT store_name, refund_reason, SUM(refund_amount) ... "
+                        "GROUP BY 1,2。不要先发 {} 再补 SQL。"
                     ),
                 },
                 ensure_ascii=False,

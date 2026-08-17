@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .llm import ChatLLM, PaceMode
 from .schema_pack import build_schema_pack
-from .tools import TOOL_DEFINITIONS, ToolRuntime, _extract_finish_answer, _recover_finish_from_raw
+from .tools import (
+    TOOL_DEFINITIONS,
+    ToolRuntime,
+    _extract_finish_answer,
+    _recover_finish_from_raw,
+    _recover_sql_from_args,
+)
 
 
 SYSTEM_TEMPLATE = """你是零售业务数据分析 Agent。用户用中文提出查询/分析/画图需求。
@@ -48,6 +56,10 @@ SYSTEM_TEMPLATE = """你是零售业务数据分析 Agent。用户用中文提�
 - 存在显著放量且毛利率很低时，可归因「低毛利 SKU 放量拖累整体毛利率」；
   仅当该店**所有**低毛利 SKU 均未达上述阈值时，才写「不足以归因于低毛利 SKU 放量」。
 - 业务建议须与上述结论一致。
+- **原因分析建议（必须遵守）**：若某门店 Top 原因占比接近（差距 ≤3 个百分点，或同为「并列第一」），
+  建议须**同时覆盖这些并列主因**，禁止只挑其中一个写行动项。
+  例：星河路店「不符合预期」≈40%、「质量问题」≈40% → 应同时写优化商品描述/预期管理，以及质量管控；
+  不得只写其中一条。
 - **金额时间顺序（极易写反，必须遵守）**：写「增长/下降（A → B）」时，A 必须是 **Q1（前期）**，B 必须是 **Q2（后期）**。
   - 正确：增长 89.64%（Q1 41.49万元 → Q2 78.69万元）
   - 错误：增长 89.64%（78.69万元 → 41.49万元）← 箭头方向与「增长」矛盾，禁止
@@ -81,6 +93,7 @@ SQL 易错点（必须避免）：
 - `run_sql` 的 `result_name` 只是会话内存结果名，**不是**数据库表；后续不能写 `FROM q1_sales`，应把完整子查询写进同一个 WITH/SELECT。
 - 比较 Q1/Q2 时，用一个 SQL（WITH q1 AS (...), q2 AS (...)）一次算完，不要依赖上一次查询的虚表名。
 - **绝不要调用 sql 为空的 run_sql**；若上一轮失败，直接提交改好的完整 SQL。
+- 画完图后若还要下钻：下一轮 run_sql 必须立刻带上完整 SELECT/WITH，不要先发空参数占位。
 - **禁止 WHERE SUM(...)/AVG(...)**（SQLite: misuse of aggregate）。过滤聚合结果用 HAVING，或先聚合再在外层 WHERE 列名。
 - 成交销额必须写 `fs.quantity * fs.sale_price - fs.discount_amount`（乘号 `*` 不能丢）。
 - 退损率：销额 CTE（按 order_date）与退款 CTE（按 refund_date）分开汇总后再除；工具会拒收「退款表驱动且同时汇总销额」的错误写法。
@@ -114,6 +127,7 @@ class AgentResult:
 
 EventCallback = Callable[[dict[str, Any]], None]
 ProgressCallback = Callable[[str], None]
+CancelCallback = Callable[[], bool]
 
 
 def _user_wants_chart(query: str) -> bool:
@@ -137,6 +151,7 @@ class DataAnalysisAgent:
         user_query: str,
         on_progress: ProgressCallback | None = None,
         on_event: EventCallback | None = None,
+        should_cancel: CancelCallback | None = None,
     ) -> AgentResult:
         schema_pack = build_schema_pack()
         system = SYSTEM_TEMPLATE.format(schema_pack=schema_pack)
@@ -147,15 +162,62 @@ class DataAnalysisAgent:
             {"role": "user", "content": user_query},
         ]
 
+        cancel_latched = False
+
         def emit(event: dict[str, Any]) -> None:
+            nonlocal cancel_latched
             process_steps.append(event)
             if on_event:
-                on_event(event)
+                try:
+                    on_event(event)
+                except BaseException as exc:  # noqa: BLE001 — Streamlit Stop is BaseException
+                    # Allow cooperative cancel to finish; never swallow rerun.
+                    name = type(exc).__name__
+                    if name == "RerunException":
+                        raise
+                    if name in {"StopException", "ScriptControlException"}:
+                        cancel_latched = True
+                        return
+                    raise
             text = event.get("text")
             if text and on_progress:
                 on_progress(text)
 
+        def cancelled() -> bool:
+            nonlocal cancel_latched
+            if cancel_latched:
+                return True
+            if not should_cancel:
+                return False
+            try:
+                if should_cancel():
+                    cancel_latched = True
+                    return True
+            except BaseException as exc:  # noqa: BLE001 — session_state yield under STOP
+                name = type(exc).__name__
+                if name == "RerunException":
+                    raise
+                if name in {"StopException", "ScriptControlException"}:
+                    cancel_latched = True
+                    return True
+                raise
+            return False
+
+        def cancel_result(step: int) -> AgentResult:
+            emit({"type": "warn", "step": step, "text": "用户已停止分析"})
+            return AgentResult(
+                answer="分析已停止。可修改问题后重新提问。",
+                figures=runtime.artifacts.figures,
+                tables=runtime.artifacts.tables,
+                logs=runtime.artifacts.logs,
+                process_steps=process_steps,
+                steps=max(0, step),
+                error="cancelled",
+            )
+
         for step in range(1, self.max_steps + 1):
+            if cancelled():
+                return cancel_result(step - 1)
             if step == 1:
                 llm_text = (
                     f"第 {step}/{self.max_steps} 轮：模型理解问题，规划并开始执行"
@@ -167,9 +229,22 @@ class DataAnalysisAgent:
                     "（改 SQL / 画图 / 下钻 / 输出结论）…"
                 )
             emit({"type": "llm", "step": step, "text": llm_text})
+            pool = ThreadPoolExecutor(max_workers=1)
+            fut = pool.submit(self.llm.chat, messages, TOOL_DEFINITIONS, 0.0)
             try:
-                resp = self.llm.chat(messages, tools=TOOL_DEFINITIONS, temperature=0.0)
+                resp = None
+                while True:
+                    if cancelled():
+                        # Do not wait for the in-flight HTTP call; UI can show 已停止.
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        return cancel_result(step)
+                    try:
+                        resp = fut.result(timeout=0.35)
+                        break
+                    except FuturesTimeout:
+                        continue
             except Exception as exc:  # noqa: BLE001
+                pool.shutdown(wait=False, cancel_futures=True)
                 emit({"type": "error", "step": step, "text": f"模型调用失败：{exc}"})
                 return AgentResult(
                     answer=f"模型调用失败：{exc}",
@@ -180,6 +255,11 @@ class DataAnalysisAgent:
                     steps=step,
                     error=str(exc),
                 )
+            else:
+                pool.shutdown(wait=False)
+
+            if cancelled():
+                return cancel_result(step)
 
             msg = resp.choices[0].message
             tool_calls = getattr(msg, "tool_calls", None) or []
@@ -289,6 +369,41 @@ class DataAnalysisAgent:
                     if answer:
                         args = {"answer_markdown": answer}
 
+                # run_sql: recover sql from aliases / broken JSON before dispatch
+                if name == "run_sql":
+                    sql = _recover_sql_from_args(args if isinstance(args, dict) else {}, raw_args)
+                    if sql:
+                        args = {**(args if isinstance(args, dict) else {}), "sql": sql}
+                    else:
+                        tool_result = json.dumps(
+                            {
+                                "ok": False,
+                                "error": "SQL is empty",
+                                "hint": (
+                                    "本次 run_sql 未带 sql。请立刻重试，arguments 必须形如："
+                                    '{"sql":"SELECT ...","result_name":"..."}；'
+                                    "禁止空对象 {} 或 sql:\"\"。"
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": tool_result,
+                            }
+                        )
+                        emit(
+                            {
+                                "type": "tool_end",
+                                "step": step,
+                                "tool": name,
+                                "text": "run_sql 失败：SQL is empty（已跳过空调用）",
+                            }
+                        )
+                        continue
+
                 detail = _tool_preview(name, args)
                 emit({"type": "tool_start", "step": step, "tool": name, "text": detail})
                 figs_before = len(runtime.artifacts.figures)
@@ -349,11 +464,16 @@ class DataAnalysisAgent:
                     event["figure"] = {"title": title, "fig": fig}
                 emit(event)
 
+                if cancelled():
+                    return cancel_result(step)
+
                 if name == "finish" and runtime.artifacts.final_answer:
                     finished = True
 
             if finished and runtime.artifacts.final_answer:
                 emit({"type": "done", "step": step, "text": "分析完成，正在整理结论与图表…"})
+                if cancelled():
+                    return cancel_result(step)
                 return AgentResult(
                     answer=runtime.artifacts.final_answer,
                     figures=runtime.artifacts.figures,
