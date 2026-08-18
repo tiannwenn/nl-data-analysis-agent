@@ -68,10 +68,39 @@ def _ensure_database() -> None:
     st.success("导入完成：" + ", ".join(f"{k}={v}" for k, v in counts.items()))
 
 
+def _fix_markdown_bold(text: str) -> str:
+    """Make LLM **bold** render in Streamlit without leaving literal ``**``.
+
+    Must stay **same-line only**. A previous cross-line ``[^*]+`` pattern
+    rewrote ``**星河路店**`` into ``** 星河路店**`` and made things worse.
+    """
+    text = re.sub(
+        r"<strong>(.*?)</strong>",
+        r"**\1**",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(r"</?strong>", "", text, flags=re.IGNORECASE)
+
+    def _trim_inner(match: re.Match[str]) -> str:
+        return f"**{match.group(1).strip()}**"
+
+    # Trim spaces inside **…** on the same line: ``** 星河路店**`` → ``**星河路店**``
+    text = re.sub(r"\*\*\s*([^*\n]+?)\s*\*\*", _trim_inner, text)
+    # ``**即时零售（O2O）**渠道`` needs a space after closing ** (same line only).
+    text = re.sub(
+        r"(\*\*[^*\n]+?\*\*)(?=[\u4e00-\u9fffA-Za-z])",
+        r"\1 ",
+        text,
+    )
+    return text
+
+
 def _clean_answer(text: str) -> str:
     cleaned = _FAKE_LINK_RE.sub("", text or "")
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = _fix_markdown_bold(cleaned)
     return cleaned.strip()
 
 

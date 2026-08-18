@@ -114,7 +114,7 @@
 2. 术语映射（business_terms：即时零售对应 channel_code='O2O'，战区对应 region 等）
 3. 指标口径（销额=quantity*sale_price-discount_amount；毛利率用 unit_cost 等）
 4. 选表选字段（DDL + 各表 md 说明关联键）
-5. 模型生成只读 SQL，由 run_sql 确定性执行``
+5. 模型生成只读 SQL，由 run_sql 确定性执行
 
 示例：
 
@@ -160,7 +160,7 @@
 
 ## 5. Agent 工作流设计（ReAct + Tools）
 
-### 5.1 主循环
+### 5.1 主循环	
 
 `DataAnalysisAgent.run()`：
 
