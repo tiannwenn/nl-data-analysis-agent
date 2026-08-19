@@ -129,9 +129,34 @@ METRIC_RULES = """
 
 ## 画图约定
 
-- 「各门店对比图」= 全部有数据的门店都必须出现在图上
-- 阈值筛选（如退损率>5%）只用于文字名单与原因下钻，禁止作为对比图的唯一数据源
+- 「各门店 / 每家门店对比图」= 全部有数据的门店都必须出现在图上
+- 阈值筛选（如退损率>5%、销额增长>10%）只用于文字名单与原因下钻，禁止作为对比图的唯一数据源
 - 退损率作图：输出 `refund_rate_pct = 退损率 * 100`，纵轴为「退损率（%）」；可用 plot_chart 的 threshold_y=5 高亮超阈值门店，但仍须传入全部门店结果
+- 门店 Q1/Q2 销额对比**正确模板**（「比较每家门店两季度销售额并找出增长>10%」时仿写；先全量再文字筛选）：
+  ```
+  WITH q1 AS (
+    SELECT st.store_name,
+           SUM(fs.quantity * fs.sale_price - fs.discount_amount) AS q1_sales
+    FROM fact_sales fs
+    JOIN dim_store st ON fs.store_id = st.store_id
+    WHERE fs.order_date BETWEEN '2025-01-01' AND '2025-03-31'
+    GROUP BY st.store_name
+  ),
+  q2 AS (
+    SELECT st.store_name,
+           SUM(fs.quantity * fs.sale_price - fs.discount_amount) AS q2_sales
+    FROM fact_sales fs
+    JOIN dim_store st ON fs.store_id = st.store_id
+    WHERE fs.order_date BETWEEN '2025-04-01' AND '2025-06-30'
+    GROUP BY st.store_name
+  )
+  SELECT q1.store_name, q1.q1_sales, q2.q2_sales,
+         (q2.q2_sales - q1.q1_sales) * 1.0 / NULLIF(q1.q1_sales, 0) AS growth
+  FROM q1
+  JOIN q2 USING (store_name)
+  ORDER BY q1.store_name
+  ```
+  说明：plot_chart 用全量结果（x=store_name, y=['q1_sales','q2_sales']）；增长>10% 只在文字里点名，不要先 WHERE growth>0.1 再画图。
 """.strip()
 
 

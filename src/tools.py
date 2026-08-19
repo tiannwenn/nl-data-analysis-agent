@@ -290,13 +290,21 @@ def _recover_sql_from_args(args: dict[str, Any], raw_args: str = "") -> str:
 def _should_stack_bars(df: pd.DataFrame, x: str, color: str | None, title: str) -> bool:
     """Stack only for composition charts (e.g. SKU share within a store).
 
-    Never stack Q1/Q2 series comparisons (color == 系列 / quarter).
+    Never stack series that users need to compare side-by-side:
+    Q1/Q2 (quarter / 系列) and sales channels (channel_code / 渠道).
     """
     if not color or color not in df.columns:
         return False
     color_l = str(color).lower()
     # Melted wide Q1/Q2 or explicit quarter => always grouped side-by-side
     if color in {"系列", "quarter"} or "quarter" in color_l or color_l in {"q1", "q2"}:
+        return False
+    # Channel mix (POS/O2O/B2B) is a comparison, not a composition stack
+    if (
+        color in {"channel_code", "channel", "渠道"}
+        or "channel" in color_l
+        or "渠道" in str(color)
+    ):
         return False
     if any(k in color_l for k in ("product", "sku", "category", "商品", "品类")):
         return True
@@ -384,7 +392,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "name": "plot_chart",
             "description": (
                 "Create a bar/line/pie chart from a stored query result. "
-                "For『各门店对比图』, ALWAYS plot the full-store result. "
+                "If the user asked to compare『各门店/每家门店』then find a threshold "
+                "(e.g. growth>10%), ALWAYS plot the full-store Q1/Q2 result — "
+                "do NOT plot only stores that passed the filter. "
+                "If the question is mainly to drill into already-filtered stores "
+                "(e.g. growth AND margin drop + SKU analysis), plotting only those stores is OK. "
                 "Q1/Q2 comparison options: "
                 "(A) long format: x=store_name, y=sales_amount, color=quarter; "
                 "(B) wide format: x=store_name, y=['q1_sales','q2_sales'] — tool melts automatically. "
@@ -414,7 +426,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": (
                             "Chart caption without『图N』prefix (tool adds it). "
-                            "Example:『2025年Q1与Q2门店销额对比（星河路店和科技园店销额显著增长）』"
+                            "For all-store Q1/Q2 sales charts prefer: "
+                            "『2025年各门店Q1与Q2销售额对比（星河路店和科技园店增长超10%）」"
                         ),
                     },
                     "color": {
@@ -1043,14 +1056,14 @@ class ToolRuntime:
         cov = _sku_coverage_warning(df, title_body)
         if cov:
             warning = cov
-        # Only warn for true "all stores" charts; skip when analysis is intentionally filtered.
-        filtered_intent = any(
-            k in title_body
-            for k in ("超过", "增长", "下降", "筛选", "高退损", "Top", "TOP", "最好")
+        # Warn when caption claims all-store comparison but data is a filtered subset.
+        # Do NOT skip this because the title also mentions「增长/超过」— that is the
+        # takeaway, not permission to drop other stores from a「各门店」chart.
+        title_asks_all_stores = any(
+            k in title_body for k in ("各门店", "每家门店", "全部门店")
         )
-        title_asks_all_stores = any(k in title_body for k in ("各门店", "每家门店", "全部门店"))
         n_cats = plot_df[x].nunique() if x in plot_df.columns else len(plot_df)
-        if title_asks_all_stores and not filtered_intent and x in ("store_name", "store_id"):
+        if title_asks_all_stores and x in ("store_name", "store_id"):
             try:
                 from .db import connect
 
@@ -1058,8 +1071,9 @@ class ToolRuntime:
                     n_stores = conn.execute("SELECT COUNT(*) FROM dim_store").fetchone()[0]
                 if int(n_cats) < int(n_stores):
                     store_warn = (
-                        f"提示：标题含「各门店」但图中仅 {n_cats} 家门店（库中共 {n_stores} 家）。"
-                        "若用户要全量对比请重查全部门店；若只分析筛出的门店则无需重画。"
+                        f"提示：标题含「各门店/每家门店」，但图中仅 {n_cats} 家门店"
+                        f"（库中共 {n_stores} 家）。请改用未按增长/阈值筛选的全量结果重画；"
+                        "阈值门店只在文字里点名。"
                     )
                     warning = f"{warning} {store_warn}".strip() if warning else store_warn
             except Exception:  # noqa: BLE001
