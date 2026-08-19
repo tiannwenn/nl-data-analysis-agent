@@ -393,10 +393,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "description": (
                 "Create a bar/line/pie chart from a stored query result. "
                 "If the user asked to compare『各门店/每家门店』then find a threshold "
-                "(e.g. growth>10%), ALWAYS plot the full-store Q1/Q2 result — "
-                "do NOT plot only stores that passed the filter. "
-                "If the question is mainly to drill into already-filtered stores "
-                "(e.g. growth AND margin drop + SKU analysis), plotting only those stores is OK. "
+                "(e.g. growth>10%, example 4) or『全部门店退损率对比』(example 3), "
+                "ALWAYS plot the full-store result — do NOT plot only stores that passed the filter. "
+                "If the user asked to find stores matching a condition and compare『这些门店』 "
+                "(e.g. Q2 sales declined vs Q1, or growth+margin-drop drill-down), "
+                "plot ONLY the filtered stores; title must NOT contain『各门店/每家门店/全部门店』— "
+                "use『下降门店』or store names matching the result rows. "
                 "Q1/Q2 comparison options: "
                 "(A) long format: x=store_name, y=sales_amount, color=quarter; "
                 "(B) wide format: x=store_name, y=['q1_sales','q2_sales'] — tool melts automatically. "
@@ -426,8 +428,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": (
                             "Chart caption without『图N』prefix (tool adds it). "
-                            "For all-store Q1/Q2 sales charts prefer: "
-                            "『2025年各门店Q1与Q2销售额对比（星河路店和科技园店增长超10%）」"
+                            "Must match the plotted rows: all-store charts may use『各门店』"
+                            " (e.g.『2025年各门店Q1与Q2销售额对比（…增长超10%）』); "
+                            "filtered-store charts must NOT use『各门店』"
+                            " (e.g.『2025年Q2相对Q1销售额下降门店对比（天府店下降16.56%）』)."
                         ),
                     },
                     "color": {
@@ -1072,8 +1076,12 @@ class ToolRuntime:
                 if int(n_cats) < int(n_stores):
                     store_warn = (
                         f"提示：标题含「各门店/每家门店」，但图中仅 {n_cats} 家门店"
-                        f"（库中共 {n_stores} 家）。请改用未按增长/阈值筛选的全量结果重画；"
-                        "阈值门店只在文字里点名。"
+                        f"（库中共 {n_stores} 家），标题与数据范围不一致。"
+                        "若用户要求各门店/每家门店对比或「比较每家门店再找阈值」（示例3/4）："
+                        "请改用未筛选的全量结果重画，阈值门店只在文字里点名。"
+                        "若用户只要求比较已筛出的门店（如下降门店、增长且毛利率下降）："
+                        "请改 title，去掉「各门店/每家门店」，写成「下降门店」或点名店名后重画同一结果，"
+                        "不要无意义改画全部门店。"
                     )
                     warning = f"{warning} {store_warn}".strip() if warning else store_warn
             except Exception:  # noqa: BLE001
